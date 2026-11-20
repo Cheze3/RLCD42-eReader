@@ -1,6 +1,7 @@
 #include "NowPlayingActivity.h"
 
 #include <Arduino.h>
+#include <ESPmDNS.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -11,6 +12,8 @@
 
 #include "MappedInputManager.h"
 #include "SerialCommands.h"
+#include "SilentRestart.h"
+#include "activities/network/WifiSelectionActivity.h"
 #include "fontIds.h"
 #include "util/TextFit.h"
 
@@ -58,11 +61,104 @@ void NowPlayingActivity::onExit() {
   serialcmd::setHandler(nullptr, nullptr);
   renderer.setOrientation(savedOrientation);
   Activity::onExit();
+  stopWifi();  // after the base class: this may restart the board
 }
 
 bool NowPlayingActivity::connected() const { return lastHostMs != 0 && millis() - lastHostMs < HOST_TIMEOUT_MS; }
 
-void NowPlayingActivity::sendEvent(const char* name) const { logSerial.printf("NP:%s\n", name); }
+void NowPlayingActivity::sendEvent(const char* name) {
+  logSerial.printf("NP:%s\n", name);
+  if (wifiActive && client.connected()) client.printf("NP:%s\n", name);
+}
+
+// ----- Wi-Fi -----------------------------------------------------------------------------------
+
+void NowPlayingActivity::startWifi() {
+  wifiAsked = true;
+  if (WiFi.status() == WL_CONNECTED) {
+    onWifiSelected(true);
+    return;
+  }
+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                         [this](const ActivityResult& result) { onWifiSelected(!result.isCancelled); });
+}
+
+void NowPlayingActivity::onWifiSelected(bool joined) {
+  if (!joined || WiFi.status() != WL_CONNECTED) {
+    wifiAsked = WiFi.getMode() != WIFI_MODE_NULL;  // WiFi may have been switched on even if the join failed
+    requestUpdate();
+    return;
+  }
+  WiFi.setSleep(false);  // modem sleep delays incoming lines by up to a second or more
+  server = makeUniqueNoThrow<WiFiServer>(nowplaying::kTcpPort);
+  if (!server) {
+    LOG_ERR("NOWPLAY", "out of memory: Wi-Fi server");
+    requestUpdate();
+    return;
+  }
+  server->begin();
+  MDNS.end();
+  if (!MDNS.begin(nowplaying::kHostName)) LOG_ERR("NOWPLAY", "mDNS failed to start");
+  wifiActive = true;
+  LOG_INF("NOWPLAY", "listening on %s:%u", WiFi.localIP().toString().c_str(),
+          static_cast<unsigned>(nowplaying::kTcpPort));
+  requestUpdate();
+}
+
+// WiFi leaves the heap fragmented, so (like the file-transfer screen) end the session with a restart to Home.
+void NowPlayingActivity::stopWifi() {
+  if (!wifiAsked) return;
+  if (client) client.stop();
+  server.reset();
+  MDNS.end();
+  if (WiFi.getMode() != WIFI_MODE_NULL) {
+    WiFi.disconnect(false);
+    delay(30);
+    silentRestart();
+  }
+}
+
+void NowPlayingActivity::pumpNetwork() {
+  if (!wifiActive) return;
+  if (!client || !client.connected()) {
+    WiFiClient fresh = server->accept();
+    if (!fresh) return;
+    client.stop();
+    client = fresh;
+    client.setNoDelay(true);
+    lineLen = 0;
+    lineTooLong = false;
+    char hello[24];
+    snprintf(hello, sizeof(hello), "HELLO %d", ART_SIZE);
+    sendEvent(hello);
+  }
+  int budget = 2048;  // bytes per pass, so a fast sender cannot starve the buttons
+  while (budget-- > 0 && client.available() > 0) {
+    const int ch = client.read();
+    if (ch < 0) break;
+    if (ch == '\n') {
+      if (!lineTooLong) {
+        lineBuf[lineLen] = '\0';
+        handleNetworkLine(lineBuf);
+      }
+      lineLen = 0;
+      lineTooLong = false;
+    } else if (lineLen + 1 < LINE_BYTES) {
+      lineBuf[lineLen++] = static_cast<char>(ch);
+    } else {
+      lineTooLong = true;  // drop the rest of an over-long line
+    }
+  }
+}
+
+// A network line has the same form as a serial one: "CMD:NP <verb> ...".
+void NowPlayingActivity::handleNetworkLine(const char* line) {
+  size_t len = strlen(line);
+  while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ')) --len;
+  if (len < 7 || strncmp(line, "CMD:NP ", 7) != 0) return;
+  lineBuf[len] = '\0';   // the trimmed line is still in lineBuf
+  handleLine(line + 4);  // from "NP "
+}
 
 uint32_t NowPlayingActivity::displayPositionSec() const {
   uint32_t pos = basePositionSec;
@@ -159,6 +255,11 @@ void NowPlayingActivity::loop() {
     onGoHome();
     return;
   }
+  pumpNetwork();
+  if (!connected() && !wifiAsked && mappedInput.wasReleased(Button::Confirm)) {
+    startWifi();  // hold KEY on the waiting screen
+    return;
+  }
   if (mappedInput.wasReleased(Button::Up)) {
     sendEvent("PLAYPAUSE");
   } else if (mappedInput.wasReleased(Button::Down)) {
@@ -189,8 +290,26 @@ void NowPlayingActivity::render(RenderLock&&) {
   if (!connected()) {
     renderer.drawCenteredText(UI_12_FONT_ID, h / 2 - 60, "Now Playing", true, EpdFontFamily::BOLD);
     renderer.drawCenteredText(UI_10_FONT_ID, h / 2 - 20, "Waiting for the computer", true);
-    renderer.drawCenteredText(SMALL_FONT_ID, h / 2 + 12, "Connect the USB cable and run", true);
-    renderer.drawCenteredText(SMALL_FONT_ID, h / 2 + 12 + lineHeight + 2, "tools/nowplaying/nowplaying.py", true);
+    // The full command to type, wrapped to the screen width.
+    int y = h / 2 + 12;
+    const auto drawWrapped = [&](const char* text) {
+      for (const std::string& line : renderer.wrappedText(SMALL_FONT_ID, text, w - 2 * MARGIN, 2)) {
+        renderer.drawCenteredText(SMALL_FONT_ID, y, line.c_str(), true);
+        y += lineHeight + 2;
+      }
+    };
+    if (wifiActive) {
+      char info[96];
+      snprintf(info, sizeof(info), "Wi-Fi: %s", WiFi.localIP().toString().c_str());
+      drawWrapped(info);
+      drawWrapped("Run in tools/nowplaying:");
+      snprintf(info, sizeof(info), ".venv/bin/python nowplaying.py --host %s.local", nowplaying::kHostName);
+      drawWrapped(info);
+    } else {
+      drawWrapped("USB cable, then run in tools/nowplaying:");
+      drawWrapped(".venv/bin/python nowplaying.py");
+      drawWrapped("Wi-Fi: hold the KEY button");
+    }
   } else {
     std::lock_guard<std::mutex> guard(lock);
     // Cover art: 1 bit per pixel, 1 = black; with a thin frame, on the left.

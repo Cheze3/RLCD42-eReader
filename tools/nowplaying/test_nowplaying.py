@@ -197,5 +197,102 @@ class CoverArt(unittest.TestCase):
         self.assertEqual(len(np.make_art(np.demo_art())), 5000)
 
 
+
+
+class WindowsHelpers(unittest.TestCase):
+    def test_playback_status_names(self):
+        import nowplaying_windows as w
+        self.assertEqual([w.state_name(n) for n in (0, 1, 2, 3, 4, 5)],
+                         ["stopped", "stopped", "paused", "stopped", "playing", "paused"])
+
+    def test_position_advances_only_while_playing(self):
+        import nowplaying_windows as w
+        self.assertEqual(w.live_position(10, 100, 105, True, 200), 15)
+        self.assertEqual(w.live_position(10, 100, 105, False, 200), 10)
+
+    def test_position_is_kept_inside_the_track(self):
+        import nowplaying_windows as w
+        self.assertEqual(w.live_position(198, 100, 110, True, 200), 200)
+        self.assertEqual(w.live_position(5, 100, 90, True, 0), 5)  # a clock step back never subtracts
+
+
+class WifiLink(unittest.TestCase):
+    def test_constants_match_the_firmware_header(self):
+        import os, re
+        header = os.path.join(os.path.dirname(__file__), "..", "..", "lib", "NowPlaying", "src", "nowplaying", "Protocol.h")
+        text = open(header).read()
+        self.assertEqual(int(re.search(r"kTcpPort = (\d+)", text).group(1)), proto.TCP_PORT)
+        self.assertEqual(re.search(r'kHostName = "([^"]+)"', text).group(1) + ".local", proto.HOST_NAME)
+
+    def test_a_board_talks_over_tcp(self):
+        import socket as sk, threading
+        server = sk.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        received = []
+
+        def board_side():
+            conn, _ = server.accept()
+            conn.sendall(b"NP:HELLO 200\nNP:NEXT\n")
+            received.append(conn.recv(100))
+            conn.close()
+
+        thread = threading.Thread(target=board_side)
+        thread.start()
+        board = np.Board(None, f"127.0.0.1:{port}")
+        events = []
+        for _ in range(50):
+            events += board.events()
+            if len(events) >= 2:
+                break
+        self.assertEqual(events, ["HELLO 200", "NEXT"])
+        board.send("CMD:NP PING\n")
+        thread.join()
+        self.assertEqual(received, [b"CMD:NP PING\n"])
+        with self.assertRaises(OSError):  # the board hung up
+            for _ in range(50):
+                board.events()
+        board.ser.close()
+        server.close()
+
+
+class ChoosingTheLink(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.original = np.Board
+        outer = self
+
+        class Recorder:
+            def __init__(self, port, host=None):
+                outer.calls.append((port, host))
+                if host and outer.wifi_down:
+                    raise ConnectionRefusedError("not listening")
+
+        np.Board = Recorder
+
+    def tearDown(self):
+        np.Board = self.original
+
+    def args(self, **kw):
+        import argparse
+        return argparse.Namespace(**{"port": None, "host": None, "wifi": False, **kw})
+
+    def test_usb_by_default(self):
+        self.wifi_down = False
+        np.open_board(self.args())
+        self.assertEqual(self.calls, [(None, None)])
+
+    def test_wifi_is_tried_first_with_the_flag(self):
+        self.wifi_down = False
+        np.open_board(self.args(wifi=True))
+        self.assertEqual(self.calls, [(None, proto.HOST_NAME)])
+
+    def test_usb_is_the_fallback_when_wifi_is_not_listening(self):
+        self.wifi_down = True
+        np.open_board(self.args(wifi=True))
+        self.assertEqual(self.calls, [(None, proto.HOST_NAME), (None, None)])
+
+
 if __name__ == "__main__":
     unittest.main()

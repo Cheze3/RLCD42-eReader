@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Shows what Apple Music is playing on the board's "Now Playing" screen, and lets the board's keys
-control it. Run this on the Mac, connect the board with its USB cable, then open "Now Playing" on
-the board. See README.md.
+"""Shows what is playing on the board's "Now Playing" screen, and lets the board's keys control it.
+Run this on the computer, connect the board with its USB cable, then open "Now Playing" on the board.
+See README.md.
 
-macOS only for now (Apple Music through AppleScript). The line protocol it speaks is documented in
-lib/NowPlaying/src/nowplaying/Protocol.h.
+macOS: Apple Music (through AppleScript). Windows: whatever the system media controls show (nowplaying_windows.py).
+The line protocol it speaks is documented in lib/NowPlaying/src/nowplaying/Protocol.h.
 """
 
 import argparse
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -132,6 +133,16 @@ class AppleMusic:
         self._osascript(f'tell application "Music" to {CONTROLS[event]}', timeout=5.0)
 
 
+def make_source():
+    """The media source for this computer."""
+    if sys.platform == "darwin":
+        return AppleMusic()
+    if sys.platform == "win32":
+        from nowplaying_windows import WindowsMedia
+        return WindowsMedia(Track)
+    sys.exit("Only macOS and Windows are supported (use --demo to test the screen).")
+
+
 # ----- Cover art -----------------------------------------------------------------------------
 
 def pack_bits(image) -> bytes:
@@ -201,10 +212,42 @@ class BoardGone(Exception):
     """The board is not connected (or was unplugged)."""
 
 
+class TcpLink:
+    """A TCP connection to the board's Wi-Fi port, with the read/write/close of a serial port."""
+
+    def __init__(self, host: str, port: int = proto.TCP_PORT):
+        self.sock = socket.create_connection((host, port), timeout=5)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def read(self, size: int) -> bytes:
+        self.sock.settimeout(0.02)
+        try:
+            data = self.sock.recv(size)
+        except socket.timeout:
+            return b""
+        if not data:
+            raise ConnectionResetError("The board closed the connection.")
+        return data
+
+    def write(self, data: bytes) -> None:
+        self.sock.settimeout(2.0)
+        self.sock.sendall(data)
+
+    def close(self) -> None:
+        self.sock.close()
+
+
 class Board:
     VID = 0x303A  # Espressif's USB vendor ID
 
-    def __init__(self, port: Optional[str]):
+    def __init__(self, port: Optional[str], host: Optional[str] = None):
+        if host:
+            name, _, number = host.partition(":")
+            self.port_name = f"{name}:{number or proto.TCP_PORT} (Wi-Fi)"
+            self.ser = TcpLink(name, int(number) if number else proto.TCP_PORT)
+            self._buffer = b""
+            self._pending: List[str] = []
+            return
         import serial
         from serial.tools import list_ports
         self._serial_module = serial
@@ -266,8 +309,20 @@ class Board:
 
 # ----- Main loop -----------------------------------------------------------------------------
 
+def open_board(args) -> "Board":
+    """--host: Wi-Fi only. --wifi: Wi-Fi if the board is listening there, otherwise USB. Default: USB."""
+    if args.host:
+        return Board(args.port, args.host)
+    if args.wifi:
+        try:
+            return Board(None, proto.HOST_NAME)
+        except OSError:
+            pass  # not listening on Wi-Fi (the user has not started it): look for the USB cable
+    return Board(args.port)
+
+
 def run(args) -> None:
-    board = Board(args.port)
+    board = open_board(args)
     args.connected = True
     try:
         _talk(args, board)
@@ -276,8 +331,8 @@ def run(args) -> None:
 
 
 def _talk(args, board) -> None:
-    print(f"Connected to the board on {board.port_name}. Open 'Now Playing' on it.", flush=True)
-    music = None if args.demo else AppleMusic()
+    print(f"Connected to the board on {board.port_name}.", flush=True)
+    music = None if args.demo else make_source()
     full_refresh = True
     art_size = proto.ART_SIZE
     last_key = object()
@@ -306,7 +361,7 @@ def _talk(args, board) -> None:
             try:
                 track = music.poll()
             except Exception as error:  # noqa: BLE001
-                print(f"Could not read Apple Music: {error}")
+                print(f"Could not read the media player: {error}")
                 track = None
 
         key = track.key if track else None
@@ -348,16 +403,24 @@ def _talk(args, board) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Show Apple Music on the board's Now Playing screen.")
+    parser = argparse.ArgumentParser(description="Show the current song on the board's Now Playing screen.")
     parser.add_argument("--port", help="serial port of the board (default: found automatically)")
+    parser.add_argument("--host", help="connect over Wi-Fi instead of USB: the board's address, e.g. "
+                                       "crosspoint-np.local or 192.168.1.20 (hold KEY on the board's "
+                                       "Now Playing screen first)")
+    parser.add_argument("--wifi", action="store_true",
+                        help="use Wi-Fi when the board is listening for it (crosspoint-np.local), otherwise USB")
     parser.add_argument("--dither", choices=["fs", "atkinson", "threshold"], default="atkinson",
                         help="how cover art is turned into black and white (default: atkinson)")
-    parser.add_argument("--demo", action="store_true", help="send a test card instead of reading Apple Music")
+    parser.add_argument("--demo", action="store_true", help="send a test card instead of reading the media player")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--wait", action="store_true",
                         help="keep running: wait for the board, and reconnect when it is unplugged or restarted "
                              "(used by the background service, see service.sh)")
     args = parser.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # a Windows console may not show Korean or Vietnamese titles
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     last_problem = None
     try:
         while True:

@@ -17,7 +17,11 @@
 // Board to computer: `NP:HELLO <artSize>` (screen opened; send a square cover of that many pixels),
 // `NP:ACK <offset>` (art chunk stored),
 // `NP:PONG`, and the controls `NP:PLAYPAUSE`, `NP:NEXT`, `NP:PREV`.
+// Over Wi-Fi the same lines travel on a TCP connection to kTcpPort (the board is "kHostName.local").
 namespace nowplaying {
+
+constexpr uint16_t kTcpPort = 8265;
+constexpr const char* kHostName = "crosspoint-np";
 
 constexpr size_t kMaxArtBytes = 8192;   // 256 x 256 at 1 bit
 constexpr size_t kMaxChunkBytes = 768;  // decoded bytes in one ARTDATA line

@@ -873,12 +873,17 @@ void WifiSelectionActivity::render(RenderLock&&) {
                     Rect{screen.x, metrics.topPadding + metrics.headerHeight, screen.width, metrics.tabBarHeight},
                     cachedMacAddress.c_str());
 
+  // The status screens centre their text, so centre it below the header and MAC band; on a short panel
+  // (300 px in landscape) the full-height centre falls inside them and the text overlaps.
+  const int bodyTop = std::max(screen.y, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight);
+  const Rect body{screen.x, bodyTop, screen.width, std::max(0, screen.y + screen.height - bodyTop)};
+
   switch (state) {
     case WifiSelectionState::AUTO_CONNECTING:
-      renderConnecting(&screen, &metrics);
+      renderConnecting(&body, &metrics);
       break;
     case WifiSelectionState::SCANNING:
-      renderConnecting(&screen, &metrics);  // Reuse connecting screen with different message
+      renderConnecting(&body, &metrics);  // Reuse connecting screen with different message
       break;
     case WifiSelectionState::NETWORK_LIST:
       renderNetworkList(&screen, &metrics);
@@ -887,10 +892,10 @@ void WifiSelectionActivity::render(RenderLock&&) {
       // Transitioning to/from the SSID keyboard subactivity - nothing to draw
       break;
     case WifiSelectionState::CONNECTING:
-      renderConnecting(&screen, &metrics);
+      renderConnecting(&body, &metrics);
       break;
     case WifiSelectionState::CONNECTED:
-      renderConnected(&screen, &metrics);
+      renderConnected(&body, &metrics);
       break;
     case WifiSelectionState::SAVE_PROMPT:
     case WifiSelectionState::FORGET_PROMPT: {
@@ -903,7 +908,7 @@ void WifiSelectionActivity::render(RenderLock&&) {
       break;
     }
     case WifiSelectionState::CONNECTION_FAILED:
-      renderConnectionFailed(&screen, &metrics);
+      renderConnectionFailed(&body, &metrics);
       break;
   }
 

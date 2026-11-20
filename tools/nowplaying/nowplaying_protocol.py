@@ -9,6 +9,8 @@ import base64
 MAX_TEXT_BYTES = 80      # board keeps at most 95 bytes; leave room, and keep each line short
 CHUNK_BYTES = 144        # raw bytes per ARTDATA line (192 base64 characters, ~215 in the line)
 ART_SIZE = 200           # default cover size; the board announces the size it wants in NP:HELLO
+TCP_PORT = 8265          # the board's Wi-Fi port (kTcpPort in Protocol.h)
+HOST_NAME = "crosspoint-np.local"  # the board's mDNS name (kHostName in Protocol.h)
 
 
 def _b64(text: str, limit: int = MAX_TEXT_BYTES) -> str:

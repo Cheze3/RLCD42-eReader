@@ -1,5 +1,6 @@
 #!/bin/sh
-# Runs Now Playing in the background at login, so it never has to be started by hand.
+# Runs Now Playing in the background at login, so it never has to be started by hand. It connects over
+# Wi-Fi when the board is listening for it, otherwise over the USB cable.
 #   ./service.sh install    start now and at every login
 #   ./service.sh stop       pause it (do this before flashing the board: it holds the USB port)
 #   ./service.sh start      resume
@@ -22,7 +23,7 @@ case "${1:-}" in
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
-    <string>$HERE/.venv/bin/python</string><string>-u</string><string>$HERE/nowplaying.py</string><string>--wait</string>
+    <string>$HERE/.venv/bin/python</string><string>-u</string><string>$HERE/nowplaying.py</string><string>--wait</string><string>--wifi</string>
   </array>
   <key>WorkingDirectory</key><string>$HERE</string>
   <key>RunAtLoad</key><true/>
