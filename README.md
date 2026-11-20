@@ -27,6 +27,8 @@ from upstream CrossPoint like this:
   official releases describe upstream and do not apply here.
 - **Added (RLCD-4.2 only, in the home menu):** Note Quiz, Music Player (MP3 from the SD card), Thermometer (the board's
   SHTC3 sensor), and Now Playing (shows Apple Music from a Mac; see `tools/nowplaying/README.md`).
+- **SDK patch:** the board needs changes to the FreeInk SDK (the display driver and board config). They are saved
+  in `patches/freeink-sdk-rlcd.patch`; see `patches/README.md` for how to apply them after cloning.
 - **Fonts:** the built-in UI fonts include Vietnamese and, in their regular weights, Korean (see
   `lib/EpdFont/scripts/convert-builtin-fonts.sh`); a 10 pt reader size was added.
 - Highlights on this panel are solid outlines instead of dotted patterns, which flicker on the reflective LCD.

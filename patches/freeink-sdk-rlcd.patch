@@ -1,0 +1,583 @@
+diff --git a/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp b/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp
+index 501b42f..85ba47c 100644
+--- a/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp
++++ b/libs/display/FreeInkDisplay/src/FreeInkDisplay.cpp
+@@ -63,6 +63,9 @@
+ #if FREEINK_DRIVER_PAPER_MONO
+ #include "driver/PaperMonoDriver.h"
+ #endif
++#if FREEINK_DRIVER_ST7305
++#include "driver/St7305Driver.h"
++#endif
+ 
+ namespace freeink {
+ namespace {
+@@ -226,7 +229,9 @@ void FreeInkDisplay::selectDriver() {
+         break;
+       }
+ #endif
+-#if FREEINK_DRIVER_UC8279C
++#if FREEINK_DRIVER_ST7305
++      _driver = &st7305Driver();
++#elif FREEINK_DRIVER_UC8279C
+       _driver = &uc8279cA4Driver();
+ #elif FREEINK_DRIVER_SSD1677
+       _driver = &ssd1677Driver();
+diff --git a/libs/display/FreeInkDisplay/src/driver/St7305Driver.cpp b/libs/display/FreeInkDisplay/src/driver/St7305Driver.cpp
+new file mode 100644
+index 0000000..e7c66e3
+--- /dev/null
++++ b/libs/display/FreeInkDisplay/src/driver/St7305Driver.cpp
+@@ -0,0 +1,171 @@
++#include "St7305Driver.h"
++
++#if FREEINK_DRIVER_ST7305
++
++#include <esp_heap_caps.h>
++
++namespace freeink {
++
++namespace {
++
++constexpr spi_host_device_t kHost = SPI3_HOST;  // SPI2 is Arduino's default `SPI`; SD is SDMMC.
++
++struct InitStep {
++  uint8_t cmd;
++  uint8_t len;
++  uint8_t data[10];
++  uint16_t delayAfterMs;
++};
++
++// Waveshare's initialization sequence for the 4.2" panel (power, timing and panel registers,
++// sleep out, 4-pixel-block data format, inversion on, GRAM window for 15,000 bytes, tearing
++// effect line on, high power mode, display on). Taken from the hardware-verified
++// `waveshare_rlcd_42` preset of the st7305-lcd crate, which follows Waveshare's own BSP.
++constexpr InitStep kInit[] = {
++    {0xD6, 2, {0x17, 0x02}, 0},
++    {0xD1, 1, {0x01}, 0},
++    {0xC0, 2, {0x11, 0x04}, 0},
++    {0xC1, 4, {0x69, 0x69, 0x69, 0x69}, 0},
++    {0xC2, 4, {0x19, 0x19, 0x19, 0x19}, 0},
++    {0xC4, 4, {0x4B, 0x4B, 0x4B, 0x4B}, 0},
++    {0xC5, 4, {0x19, 0x19, 0x19, 0x19}, 0},
++    {0xD8, 2, {0x80, 0xE9}, 0},
++    {0xB2, 1, {0x02}, 0},
++    {0xB3, 10, {0xE5, 0xF6, 0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45}, 0},
++    {0xB4, 8, {0x05, 0x46, 0x77, 0x77, 0x77, 0x77, 0x76, 0x45}, 0},
++    {0x62, 3, {0x32, 0x03, 0x1F}, 0},
++    {0xB7, 1, {0x13}, 0},
++    {0xB0, 1, {0x64}, 0},
++    {0x11, 0, {}, 200},  // sleep out
++    {0xC9, 1, {0x00}, 0},
++    {0x36, 1, {0x48}, 0},  // memory data access control
++    {0x3A, 1, {0x11}, 0},  // data format: 4-pixel blocks
++    {0xB9, 1, {0x20}, 0},
++    {0xB8, 1, {0x29}, 0},
++    {0x21, 0, {}, 0},  // display inversion on
++    {0x2A, 2, {0x12, 0x2A}, 0},  // CASET: 25 column bands of 12 pixels
++    {0x2B, 2, {0x00, 0xC7}, 0},  // RASET: 200 rows of 2-pixel pairs
++    {0x35, 1, {0x00}, 0},  // tearing-effect line on
++    {0xD0, 1, {0xFF}, 0},
++    {0x38, 0, {}, 0},  // high power mode
++    {0x29, 0, {}, 0},  // display on
++};
++
++// GRAM window for 400x300: 25 column bands of 12 pixels (0x12..0x2A) x 200 rows (0x00..0xC7)
++// x 3 bytes per address = 15,000 bytes. Also part of kInit; re-sent before every frame.
++constexpr uint8_t kCaset[] = {0x12, 0x2A};
++constexpr uint8_t kRaset[] = {0x00, 0xC7};
++
++}  // namespace
++
++uint32_t St7305Driver::spiHz() const {
++  const uint32_t hz = BoardConfig::ACTIVE.displaySpiHz;
++  return hz ? hz : 10000000u;
++}
++
++PanelGeometry St7305Driver::geometry() const {
++  const auto& p = BoardConfig::ACTIVE;
++  PanelGeometry g;
++  g.width = p.displayWidth;
++  g.height = p.displayHeight;
++  g.widthBytes = p.displayWidth / 8;
++  g.bufferSize = static_cast<uint32_t>(g.widthBytes) * g.height;
++  return g;
++}
++
++void St7305Driver::writeCmd(uint8_t cmd, const uint8_t* data, size_t len) {
++  digitalWrite(dc_, LOW);
++  spi_transaction_t t = {};
++  t.length = 8;
++  t.tx_buffer = &cmd;
++  spi_device_polling_transmit(dev_, &t);
++  if (len) writeData(data, len);
++}
++
++void St7305Driver::writeData(const uint8_t* data, size_t len) {
++  digitalWrite(dc_, HIGH);
++  spi_transaction_t t = {};
++  t.length = len * 8;
++  t.tx_buffer = data;
++  spi_device_polling_transmit(dev_, &t);
++}
++
++void St7305Driver::reset() {
++  digitalWrite(rst_, HIGH);
++  delay(50);
++  digitalWrite(rst_, LOW);
++  delay(20);
++  digitalWrite(rst_, HIGH);
++  delay(150);
++}
++
++void St7305Driver::sendInitSequence() {
++  for (const InitStep& s : kInit) {
++    writeCmd(s.cmd, s.data, s.len);
++    if (s.delayAfterMs) delay(s.delayAfterMs);
++  }
++}
++
++void St7305Driver::begin(EpdBus& /*bus*/) {
++  const auto& pins = BoardConfig::ACTIVE.display;
++  dc_ = pins.dc;
++  rst_ = pins.rst;
++
++  const PanelGeometry g = geometry();
++  const size_t gridLen = st7305::gridBytes(g.width, g.height);
++
++  if (!grid_) {
++    grid_ = static_cast<uint8_t*>(heap_caps_malloc(gridLen, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
++  }
++
++  if (!busReady_) {
++    spi_bus_config_t bc = {};
++    bc.mosi_io_num = pins.mosi;
++    bc.miso_io_num = -1;
++    bc.sclk_io_num = pins.sclk;
++    bc.quadwp_io_num = -1;
++    bc.quadhd_io_num = -1;
++    bc.max_transfer_sz = static_cast<int>(gridLen);
++    spi_bus_initialize(kHost, &bc, SPI_DMA_CH_AUTO);
++
++    spi_device_interface_config_t dc = {};
++    dc.clock_speed_hz = static_cast<int>(spiHz());
++    dc.mode = 0;
++    dc.spics_io_num = pins.cs;
++    dc.queue_size = 1;
++    spi_bus_add_device(kHost, &dc, &dev_);
++    busReady_ = true;
++  }
++
++  pinMode(dc_, OUTPUT);
++  pinMode(rst_, OUTPUT);
++  reset();
++  sendInitSequence();
++}
++
++void St7305Driver::display(EpdBus& /*bus*/, const uint8_t* fb, const uint8_t* /*prev*/, RefreshMode /*mode*/,
++                           bool /*turnOff*/) {
++  if (!grid_ || !fb) return;
++  const auto& p = BoardConfig::ACTIVE;
++  st7305::packLandscape(fb, grid_, p.displayWidth, p.displayHeight, p.orientation.mirrorX, p.orientation.mirrorY);
++
++  writeCmd(0x2A, kCaset, sizeof(kCaset));
++  writeCmd(0x2B, kRaset, sizeof(kRaset));
++  writeCmd(0x2C);  // memory write; the controller pushes GRAM to the glass on its own scan
++  writeData(grid_, st7305::gridBytes(p.displayWidth, p.displayHeight));
++}
++
++void St7305Driver::deepSleep(EpdBus& /*bus*/) {
++  // The panel is not bistable. Low power mode (1 Hz scan) keeps the image on screen for a
++  // fraction of the high-power current; a full controller sleep would blank it.
++  writeCmd(0x39);
++}
++
++PanelDriver& st7305Driver() {
++  static St7305Driver instance;
++  return instance;
++}
++
++}  // namespace freeink
++
++#endif  // FREEINK_DRIVER_ST7305
+diff --git a/libs/display/FreeInkDisplay/src/driver/St7305Driver.h b/libs/display/FreeInkDisplay/src/driver/St7305Driver.h
+new file mode 100644
+index 0000000..635f040
+--- /dev/null
++++ b/libs/display/FreeInkDisplay/src/driver/St7305Driver.h
+@@ -0,0 +1,56 @@
++#pragma once
++
++// FreeInk SDK: Sitronix ST7305 reflective-LCD panel driver (Waveshare ESP32-S3-RLCD-4.2).
++//
++// An EXTERNAL-BUS driver: it owns its SPI bus end to end (usesExternalBus() == true), so the
++// facade leaves EpdBus down, like LgfxEpdDriver / It8951Driver. The panel is a reflective LCD,
++// not e-paper: there is no BUSY line and no waveform choice, so every RefreshMode is the same
++// full-frame flush (15,000 bytes at 10 MHz is ~12 ms of SPI plus the pack).
++//
++// Place this file next to PanelDriver.h.
++
++#include <BoardConfig.h>
++
++#if FREEINK_DRIVER_ST7305
++
++#include <driver/spi_master.h>
++
++#include "PanelDriver.h"
++#include "St7305Frame.h"
++
++namespace freeink {
++
++class St7305Driver final : public PanelDriver {
++ public:
++  const char* controllerName() const override { return "ST7305"; }
++
++  uint32_t spiHz() const override;
++  // No BUSY pin on this panel; value is never consulted for an external-bus driver.
++  BusyPolarity busyPolarity() const override { return static_cast<BusyPolarity>(0); }
++  PanelGeometry geometry() const override;
++  bool usesExternalBus() const override { return true; }
++
++  void begin(EpdBus& bus) override;
++  void deepSleep(EpdBus& bus) override;
++
++  void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
++  // A windowed update buys nothing at 15 KB per frame; the base class falls back to a full
++  // flush, which is exactly what we want.
++
++ private:
++  void reset();
++  void writeCmd(uint8_t cmd, const uint8_t* data = nullptr, size_t len = 0);
++  void writeData(const uint8_t* data, size_t len);
++  void sendInitSequence();
++
++  spi_device_handle_t dev_ = nullptr;
++  bool busReady_ = false;
++  uint8_t* grid_ = nullptr;  // DMA-capable GRAM image, gridBytes(w, h)
++  int8_t dc_ = -1, rst_ = -1;
++};
++
++PanelDriver& st7305Driver();
++
++}  // namespace freeink
++
++#endif  // FREEINK_DRIVER_ST7305
+diff --git a/libs/display/FreeInkDisplay/src/driver/St7305Frame.h b/libs/display/FreeInkDisplay/src/driver/St7305Frame.h
+new file mode 100644
+index 0000000..2139934
+--- /dev/null
++++ b/libs/display/FreeInkDisplay/src/driver/St7305Frame.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++// FreeInk SDK: ST7305 frame packer (pure, no hardware, host-testable).
++//
++// Converts the facade's row-major 1-bit framebuffer into the ST7305 GRAM layout used by the
++// Waveshare ESP32-S3-RLCD-4.2 (landscape, 2x4-pixel blocks, one byte per block).
++//
++//   facade fb : row-major, `w/8` bytes per row, MSB = leftmost pixel, bit 1 = white
++//   grid      : (w/2) columns of (h/4) bytes; index = (x>>1) * (h/4) + ((h-1-y)>>2)
++//               bit  = 7 - (((h-1-y)&3) << 1 | (x&1)); bit 1 = white
++//
++// The mapping matches Waveshare's RLCD_SetLandscapePixel as reproduced in three independent
++// third-party ports (a MicroPython driver, an ESPHome component and an ESP-IDF project). Each
++// pixel owns exactly one bit, so there is no read-modify-write.
++//
++// Requires w % 8 == 0 (framebuffer rows are whole bytes) and h % 4 == 0.
++
++#include <stddef.h>
++#include <stdint.h>
++
++namespace freeink {
++namespace st7305 {
++
++// Flip if a bench test shows the image inverted (white on black).
++constexpr bool kInvertOutput = false;
++
++constexpr size_t gridBytes(uint16_t w, uint16_t h) { return static_cast<size_t>(w / 2) * (h / 4); }
++
++// `out` must hold gridBytes(w, h) bytes. mirrorX/mirrorY apply a panel mount transform to the
++// SOURCE coordinates (BoardProfile::orientation).
++inline void packLandscape(const uint8_t* fb, uint8_t* out, uint16_t w, uint16_t h, bool mirrorX, bool mirrorY) {
++  const uint16_t stride = w / 8;
++  const uint16_t cols = w / 2;
++  const uint16_t blocks = h / 4;
++  for (uint16_t bx = 0; bx < cols; ++bx) {
++    uint8_t* col = out + static_cast<size_t>(bx) * blocks;
++    for (uint16_t by = 0; by < blocks; ++by) {
++      uint8_t b = 0;
++      for (uint8_t ly = 0; ly < 4; ++ly) {
++        // GRAM row index counts up from the BOTTOM of the panel (inv_y), so panel row y is
++        // h-1-(by*4+ly).
++        const uint16_t y = static_cast<uint16_t>(h - 1 - (by * 4 + ly));
++        const uint16_t sy = mirrorY ? static_cast<uint16_t>(h - 1 - y) : y;
++        const uint8_t* row = fb + static_cast<size_t>(sy) * stride;
++        for (uint8_t lx = 0; lx < 2; ++lx) {
++          const uint16_t x = static_cast<uint16_t>(bx * 2 + lx);
++          const uint16_t sx = mirrorX ? static_cast<uint16_t>(w - 1 - x) : x;
++          const uint8_t px = (row[sx >> 3] >> (7 - (sx & 7))) & 1u;
++          b |= static_cast<uint8_t>(px << (7 - ((ly << 1) | lx)));
++        }
++      }
++      col[by] = kInvertOutput ? static_cast<uint8_t>(~b) : b;
++    }
++  }
++}
++
++}  // namespace st7305
++}  // namespace freeink
+diff --git a/libs/hardware/BatteryMonitor/src/BatteryMonitor.cpp b/libs/hardware/BatteryMonitor/src/BatteryMonitor.cpp
+index 9781c2d..624cfc1 100644
+--- a/libs/hardware/BatteryMonitor/src/BatteryMonitor.cpp
++++ b/libs/hardware/BatteryMonitor/src/BatteryMonitor.cpp
+@@ -899,6 +899,19 @@ uint16_t BatteryMonitor::readMillivolts() const {
+     return 0;
+   }
+   if (!hasAdcBackend()) return 0;
++#if FREEINK_DEVICE_WSRLCD42 && ESP_IDF_VERSION_MAJOR >= 5
++  if (BoardConfig::isWsRlcd42()) {
++    // The 100K/200K divider is a high-impedance source for the S3 ADC, so a lone read
++    // swings widely. Median of nine spaced reads rejects the outliers.
++    uint32_t samples[9];
++    for (uint32_t& s : samples) {
++      s = analogReadMilliVolts(_adcPin);
++      delayMicroseconds(200);
++    }
++    std::sort(samples, samples + 9);
++    return static_cast<uint16_t>(samples[4] * _dividerMultiplier);
++  }
++#endif
+ #if FREEINK_DEVICE_PICCO && ESP_IDF_VERSION_MAJOR >= 5
+   if (BoardConfig::isPicco()) {
+     // Three immediate conversions, once per caller-requested sample. No delays,
+diff --git a/libs/hardware/BoardConfig/include/BoardConfig.h b/libs/hardware/BoardConfig/include/BoardConfig.h
+index a077b3d..d27efea 100644
+--- a/libs/hardware/BoardConfig/include/BoardConfig.h
++++ b/libs/hardware/BoardConfig/include/BoardConfig.h
+@@ -86,6 +86,10 @@
+ #ifndef FREEINK_DEVICE_WS397
+ #define FREEINK_DEVICE_WS397 0
+ #endif
++// Waveshare ESP32-S3-RLCD-4.2: ST7305 400x300 reflective LCD (not e-paper).
++#ifndef FREEINK_DEVICE_WSRLCD42
++#define FREEINK_DEVICE_WSRLCD42 0
++#endif
+ #ifndef FREEINK_DEVICE_PICCO
+ #define FREEINK_DEVICE_PICCO 0
+ #endif
+@@ -101,10 +105,10 @@
+ #if !(FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3 || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_M5 || \
+       FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_SILKSCREEN || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_M5PAPER ||               \
+       FREEINK_DEVICE_STICKY || FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_MURPHY_M4 ||         \
+-      FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_ONEPAGE || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_METALIO_EINK4 || \
+-      FREEINK_DEVICE_PICCO)
++      FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_ONEPAGE || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_WSRLCD42 || \
++      FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_PICCO)
+ #error \
+-    "FreeInk: no device selected. Pass at least one -DFREEINK_DEVICE_<NAME> (X4, X3, X4PRO, X4CLASSIC, M5, MURPHY, SILKSCREEN, LILYGO, M5PAPER, STICKY, PAPERMONO, PAPERS3, MURPHY_M4, EEGO_A4, ONEPAGE, WS397, METALIO_EINK4, PICCO) in your build env — see platformio.sample.ini."
++    "FreeInk: no device selected. Pass at least one -DFREEINK_DEVICE_<NAME> (X4, X3, X4PRO, X4CLASSIC, M5, MURPHY, SILKSCREEN, LILYGO, M5PAPER, STICKY, PAPERMONO, PAPERS3, MURPHY_M4, EEGO_A4, ONEPAGE, WS397, WSRLCD42, METALIO_EINK4, PICCO) in your build env — see platformio.sample.ini."
+ #endif
+ // Each device belongs to one MCU family; a binary targets exactly one. X3/X4 are
+ // ESP32-C3; M5 PaperColor/Murphy/Silkscreen/LilyGo are ESP32-S3; M5Paper v1.1 is the
+@@ -115,7 +119,7 @@
+ #define FREEINK_MCU_S3                                                                                    \
+   (FREEINK_DEVICE_M5 || FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_SILKSCREEN || FREEINK_DEVICE_LILYGO ||        \
+    FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_PAPERMONO ||  \
+-   FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_METALIO_EINK4 || \
++   FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_WSRLCD42 || FREEINK_DEVICE_METALIO_EINK4 || \
+    FREEINK_DEVICE_PICCO)
+ #define FREEINK_MCU_ESP32 (FREEINK_DEVICE_M5PAPER)
+ #if (FREEINK_MCU_C3 + FREEINK_MCU_C61 + FREEINK_MCU_S3 + FREEINK_MCU_ESP32) != 1
+@@ -211,6 +215,13 @@
+ #else
+ #define FREEINK_DRIVER_UC8279C 0
+ #endif
++// Waveshare ESP32-S3-RLCD-4.2: Sitronix ST7305 reflective LCD. External-bus driver
++// (owns its SPI end to end, like LgfxEpd / IT8951). See St7305Driver.h.
++#if FREEINK_DEVICE_WSRLCD42
++#define FREEINK_DRIVER_ST7305 1
++#else
++#define FREEINK_DRIVER_ST7305 0
++#endif
+ 
+ // --- 4) Derive default capabilities (override with -DFREEINK_CAP_*=0/1) -------
+ // Every device whose profile has a touch controller. Adding a touch device or
+@@ -364,15 +375,15 @@
+ #define FREEINK_CAP_RTC                                                                             \
+   (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || \
+    FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_EEGO_A4 || \
+-   FREEINK_DEVICE_WS397 || FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_PICCO)
++   FREEINK_DEVICE_WS397 || FREEINK_DEVICE_WSRLCD42 || FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_PICCO)
+ #endif
+ #ifndef FREEINK_CAP_TEMP_HUMIDITY
+ #define FREEINK_CAP_TEMP_HUMIDITY (FREEINK_DEVICE_STICKY)
+ #endif
+ #ifndef FREEINK_CAP_IMU
+ #define FREEINK_CAP_IMU \
+-  (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_METALIO_EINK4 || \
+-   FREEINK_DEVICE_PICCO || FREEINK_DEVICE_PAPERMONO)
++  (FREEINK_DEVICE_X3 || FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_WSRLCD42 || \
++   FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_PICCO || FREEINK_DEVICE_PAPERMONO)
+ #endif
+ // Consumer-triggered vibration output; independent of audio and input events.
+ #ifndef FREEINK_CAP_HAPTIC
+@@ -421,7 +432,8 @@
+ #ifndef FREEINK_SD_SDMMC
+ #define FREEINK_SD_SDMMC                                                                            \
+   (FREEINK_DEVICE_SILKSCREEN || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_PAPERMONO || \
+-   FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_METALIO_EINK4 || FREEINK_DEVICE_PICCO)
++   FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_WSRLCD42 || FREEINK_DEVICE_METALIO_EINK4 || \
++   FREEINK_DEVICE_PICCO)
+ #endif
+ 
+ // Serial log transport hint for consumer firmware. Boards can share the same MCU
+@@ -479,6 +491,7 @@ enum class Board : uint8_t {
+   EegoA4,     // EEGO Reader A4: ESP32-S3, UC8279C 768x552 SPI panel, GSLX680 touch, PCF8563 RTC
+   OnePage,    // OnePage: ESP32-C61, SSD1677 800x480 SPI panel, 4-key ADC ladder + 3 side keys
+   WsEpaper397,  // Waveshare ESP32-S3-ePaper-3.97: SSD1677 800x480, 3 keys + BOOT, AXP2101 PMIC
++  WsRlcd42,     // Waveshare ESP32-S3-RLCD-4.2: ST7305 400x300 reflective LCD, BOOT + KEY, 1-bit SDMMC
+   MetalioEInk4,  // ESP32-S3, GDEM0397T81, CST816S, TCA9555
+   Picco,        // Onyx Picco / BOOX Tiles: ESP32-S3 (16MB flash, 8MB octal PSRAM), SSD1677/2677 800x480 portrait,
+                 // capacitive touch, 2-ch I2C frontlight, 4-bit SDMMC, ADC battery. RE'd from retail
+@@ -517,7 +530,8 @@ enum class DisplayController : uint8_t {
+   IT8951 = 5,
+   UC8279 = 6,
+   UC8179 = 7,
+-  UC8279C = 8  // EEGO A4 768x552 sibling of the UC8279 family (Uc8279cA4Driver)
++  UC8279C = 8,  // EEGO A4 768x552 sibling of the UC8279 family (Uc8279cA4Driver)
++  ST7305 = 9    // Waveshare ESP32-S3-RLCD-4.2 reflective LCD (St7305Driver, external bus)
+ };
+ 
+ // Optional capacitive touch controller.
+@@ -1766,6 +1780,62 @@ constexpr BoardProfile WS_EPAPER_397 = {
+     // The SHTC3 (0x70) has no EnvironmentSensor backend yet, so it stays 0.
+     {41, 42, 400000, 0x51, 0, 0x6B, 0, RtcType::Pcf85063, ImuType::Qmi8658}};
+ 
++// --- Waveshare ESP32-S3-RLCD-4.2: ESP32-S3-WROOM-1-N16R8, ST7305 400x300 reflective LCD --
++// NOT e-paper: a reflective monochrome LCD, so there is no BUSY line, no waveform
++// choice and no ghosting. Every RefreshMode is the same flush.
++//
++// Pins come from the board schematic (ESP32-S3-RLCD-4.2-schematic.pdf), cross-checked
++// against Waveshare's ESPHome/Arduino examples (SCLK 11, MOSI 12, CS 40, DC 5, RST 41).
++//
++// Geometry is declared in the panel's NATIVE landscape frame, 400x300, because the
++// controller's GRAM layout is landscape (2x4-pixel blocks) and 400 is a multiple of 8.
++// Portrait reading (300x400) is the firmware's orientation setting, same as the X4.
++//
++// Buttons: only BOOT (GPIO0) and KEY (GPIO18) reach the ESP32; both are active-low with
++// 10K pull-ups on the board. The PWR key (Key3) drives a power-switch IC (U3) and a
++// high-side MOSFET (Q1) on the system rail, with no net to any GPIO, so firmware
++// cannot read it. Two-button input style: BOOT = previous, KEY = next.
++//
++// SD is wired for 1-bit SDMMC: CLK 38, CMD 21, D0 39 (D1/D2 pulled up on the board).
++// Battery: ADC on GPIO4 through a 100K/200K divider (multiplier 3.0, verify with a meter).
++// I2C (SDA 13, SCL 14) is shared by the PCF85063 RTC (0x51), SHTC3 (0x70), QMI8658 IMU,
++// ES8311 and ES7210. The LCD TE (tearing-effect) output is on GPIO6 and is not used.
++constexpr BoardProfile WS_RLCD_42 = {
++    Board::WsRlcd42,
++    "ws_rlcd42",
++    InputStyle::DigitalTwoButton,
++    DisplayController::ST7305,
++    400,
++    300,
++    // SCLK11 MOSI12 CS40 DC5 RST41; no BUSY, no power-enable GPIO.
++    {11, 12, 40, 5, 41, PIN_UNASSIGNED, PIN_UNASSIGNED},
++    10000000,  // displaySpiHz: Waveshare's ESP-IDF BSP clock
++    // SD is 1-bit SDMMC (sdmmc field below); these SPI pins are unused.
++    {PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, false, 0},
++    // up = BOOT (GPIO0), down = KEY (GPIO18), both active-low. The PWR key is not wired to a
++    // GPIO, so BOOT doubles as the deep-sleep wake key (power = 0; PowerManager arms ext1
++    // on it). DigitalTwoButton synthesizes POWER from the chord, not from this pin.
++    {PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 0, 18, 0, false},
++    4,               // batteryAdc: GPIO4
++    PIN_UNASSIGNED,  // batteryChargeStatus: none exposed (charger STAT is not on a GPIO net)
++    3.0f,            // batteryDividerMultiplier: 200K/100K divider
++    PIN_UNASSIGNED,  // usbDetect
++    NO_TOUCH,
++    NO_FRONTLIGHT,
++    NO_AUDIO,  // ES8311 codec + NS4150B amp are wired but unused by the reader
++    NO_LEDS,
++    NO_FLIP,
++    {38, 21, 39, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, 1},  // SDMMC 1-bit: CLK38 CMD21 D0=39
++    NO_GAUGE,                                                         // ADC battery
++    {MicInput::None, PIN_UNASSIGNED, PIN_UNASSIGNED, PIN_UNASSIGNED, true},
++    // PCF85063 RTC (0x51) and QMI8658 IMU (0x6B) on the shared I2C bus. SHTC3 (0x70) has
++    // no EnvironmentSensor backend, so it stays 0.
++    {13, 14, 400000, 0x51, 0, 0x6B, 0, RtcType::Pcf85063, ImuType::Qmi8658},
++    1.0f,                                  // uiScale
++    {PIN_UNASSIGNED, PIN_UNASSIGNED},      // power latch: none
++    0,                                     // displayControllerVariant
++    {0, 0, 0, 0}};  // viewableInsets: no bezel measured yet; was the X4 default {9, 3, 3, 3}
++
+ // Metalio E-Ink 4: pin mapping follows metalio-hw-test v2.0.51 config.h.
+ // The supplied GPIO workbook reverses DC/RST; see docs/metalio-eink4-support.md.
+ constexpr BoardProfile METALIO_EINK4 = {
+@@ -2141,7 +2211,7 @@ constexpr uint32_t cmax(uint32_t a, uint32_t b) { return a > b ? a : b; }
+ constexpr uint32_t panelBytes(const BoardProfile& p) {
+   return static_cast<uint32_t>(p.displayWidth / 8) * p.displayHeight;
+ }
+-constexpr uint32_t MAX_FRAMEBUFFER_BYTES = cmax(
++constexpr uint32_t MAX_FRAMEBUFFER_BYTES_BASE = cmax(
+     cmax(cmax(FREEINK_DEVICE_X4 ? panelBytes(XTEINK_X4) : 0u, FREEINK_DEVICE_X3 ? panelBytes(XTEINK_X3) : 0u),
+          cmax(FREEINK_DEVICE_M5 ? panelBytes(M5STACK_PAPER_COLOR) : 0u,
+               FREEINK_DEVICE_MURPHY ? panelBytes(MURPHY_M3) : 0u)),
+@@ -2159,12 +2229,16 @@ constexpr uint32_t MAX_FRAMEBUFFER_BYTES = cmax(
+                         cmax(FREEINK_DEVICE_WS397 ? panelBytes(WS_EPAPER_397) : 0u,
+                              cmax(FREEINK_DEVICE_METALIO_EINK4 ? panelBytes(METALIO_EINK4) : 0u,
+                                   FREEINK_DEVICE_PICCO ? panelBytes(PICCO) : 0u)))))));
++constexpr uint32_t MAX_FRAMEBUFFER_BYTES =
++    cmax(MAX_FRAMEBUFFER_BYTES_BASE, FREEINK_DEVICE_WSRLCD42 ? panelBytes(WS_RLCD_42) : 0u);
+ 
+ // Compile-time default device — the profile ACTIVE starts as. With a single
+ // device in the build this is the only device; with several same-MCU devices it
+ // is the boot default until the consumer calls selectDevice().
+ #if FREEINK_DEVICE_METALIO_EINK4
+ constexpr BoardProfile DEFAULT_DEVICE = METALIO_EINK4;
++#elif FREEINK_DEVICE_WSRLCD42
++constexpr BoardProfile DEFAULT_DEVICE = WS_RLCD_42;
+ #elif FREEINK_DEVICE_WS397
+ constexpr BoardProfile DEFAULT_DEVICE = WS_EPAPER_397;
+ #elif FREEINK_DEVICE_PICCO
+@@ -2251,6 +2325,7 @@ FREEINK_CHECK_TOUCH_DRIVER(FREEINK_DEVICE_EEGO_A4, EEGO_A4);
+ FREEINK_CHECK_TOUCH_DRIVER(FREEINK_DEVICE_ONEPAGE, ONEPAGE);
+ FREEINK_CHECK_TOUCH_DRIVER(FREEINK_DEVICE_METALIO_EINK4, METALIO_EINK4);
+ FREEINK_CHECK_TOUCH_DRIVER(FREEINK_DEVICE_WS397, WS_EPAPER_397);
++FREEINK_CHECK_TOUCH_DRIVER(FREEINK_DEVICE_WSRLCD42, WS_RLCD_42);
+ FREEINK_CHECK_TOUCH_DRIVER(FREEINK_DEVICE_PICCO, PICCO);
+ FREEINK_CHECK_TOUCH_DRIVER(1, DEFAULT_DEVICE);  // a device missing above still boots as this
+ #undef FREEINK_CHECK_TOUCH_DRIVER
+@@ -2357,6 +2432,11 @@ inline bool selectDevice(Board which) {
+       ACTIVE = WS_EPAPER_397;
+       break;
+ #endif
++#if FREEINK_DEVICE_WSRLCD42
++    case Board::WsRlcd42:
++      ACTIVE = WS_RLCD_42;
++      break;
++#endif
+ #if FREEINK_DEVICE_PICCO
+     case Board::Picco:
+       ACTIVE = PICCO;
+@@ -2387,6 +2467,7 @@ inline bool isEegoA4() { return ACTIVE.board == Board::EegoA4; }
+ inline bool isMetalioEInk4() { return ACTIVE.board == Board::MetalioEInk4; }
+ inline bool isOnePage() { return ACTIVE.board == Board::OnePage; }
+ inline bool isWsEpaper397() { return ACTIVE.board == Board::WsEpaper397; }
++inline bool isWsRlcd42() { return ACTIVE.board == Board::WsRlcd42; }
+ inline bool isPicco() { return ACTIVE.board == Board::Picco; }
+ inline bool hasTouch() { return ACTIVE.touch.controller != TouchController::None; }
+ inline bool hasHomeKey() { return ACTIVE.touch.hasHomeKey; }
+diff --git a/libs/hardware/InputManager/src/InputManager.cpp b/libs/hardware/InputManager/src/InputManager.cpp
+index 9db8741..6a3d28f 100644
+--- a/libs/hardware/InputManager/src/InputManager.cpp
++++ b/libs/hardware/InputManager/src/InputManager.cpp
+@@ -604,7 +604,9 @@ void InputManager::updateDigitalTwoButton(const unsigned long currentTime) {
+   }
+ 
+   uint8_t nextState = auxiliaryState;
+-  if (currentTime - twoButtonPressStart >= TWO_BUTTON_HOLD_MS) {
++  // The RLCD board has only these two keys, so a shorter hold keeps Back/Confirm responsive.
++  const unsigned long holdMs = BoardConfig::isWsRlcd42() ? 400UL : TWO_BUTTON_HOLD_MS;
++  if (currentTime - twoButtonPressStart >= holdMs) {
+     twoButtonLongPressActive = true;
+     const uint8_t logical = physical == 1 ? BTN_BACK : physical == 2 ? BTN_CONFIRM : BTN_POWER;
+     nextState |= static_cast<uint8_t>(1u << logical);
