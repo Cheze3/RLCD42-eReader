@@ -197,6 +197,10 @@ def demo_art(size: int = proto.ART_SIZE) -> bytes:
 _EVENT = re.compile(r"NP:(HELLO \d+|ACK \d+|PONG|PLAYPAUSE|NEXT|PREV)(?![A-Za-z0-9])")
 
 
+class BoardGone(Exception):
+    """The board is not connected (or was unplugged)."""
+
+
 class Board:
     VID = 0x303A  # Espressif's USB vendor ID
 
@@ -207,7 +211,7 @@ class Board:
         if port is None:
             ports = [p.device for p in list_ports.comports() if p.vid == self.VID]
             if not ports:
-                sys.exit("No board found. Connect it with the USB cable, or pass --port.")
+                raise BoardGone("No board found. Connect it with the USB cable, or pass --port.")
             port = ports[0]
         self.port_name = port
         self.ser = serial.Serial(port, 115200, timeout=0.02, write_timeout=2)
@@ -264,7 +268,15 @@ class Board:
 
 def run(args) -> None:
     board = Board(args.port)
-    print(f"Connected to the board on {board.port_name}. Open 'Now Playing' on it.")
+    args.connected = True
+    try:
+        _talk(args, board)
+    finally:
+        board.ser.close()
+
+
+def _talk(args, board) -> None:
+    print(f"Connected to the board on {board.port_name}. Open 'Now Playing' on it.", flush=True)
     music = None if args.demo else AppleMusic()
     full_refresh = True
     art_size = proto.ART_SIZE
@@ -342,9 +354,24 @@ def main() -> None:
                         help="how cover art is turned into black and white (default: atkinson)")
     parser.add_argument("--demo", action="store_true", help="send a test card instead of reading Apple Music")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--wait", action="store_true",
+                        help="keep running: wait for the board, and reconnect when it is unplugged or restarted "
+                             "(used by the background service, see service.sh)")
     args = parser.parse_args()
+    last_problem = None
     try:
-        run(args)
+        while True:
+            try:
+                run(args)
+            except (BoardGone, OSError) as error:  # a serial error is an OSError
+                if not args.wait:
+                    sys.exit(str(error))
+                if getattr(args, "connected", False):  # it was connected, so this is a new problem
+                    args.connected, last_problem = False, None
+                if str(error) != last_problem:  # log a repeated problem once, not every few seconds
+                    print(f"Waiting for the board: {error}", flush=True)
+                    last_problem = str(error)
+                time.sleep(3)
     except KeyboardInterrupt:
         print("\nStopped.")
 

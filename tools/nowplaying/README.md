@@ -23,6 +23,21 @@ missed the prompt: System Settings > Privacy & Security > Automation.
 Opening the serial port restarts the board, so start the program **first**, then open Now Playing on
 the board. Leave the program running; stopping it and starting it again restarts the board again.
 
+## Start it automatically (optional)
+
+To avoid starting the program by hand, install it as a macOS login service:
+
+```
+./service.sh install
+```
+
+It then starts at every login, waits for the board, and reconnects when the board is unplugged or
+restarted. Other commands: `status`, `log`, `start`, `stop`, `uninstall`.
+
+The program holds the board's USB port, so **run `./service.sh stop` before flashing the board** and
+`./service.sh start` afterwards. If you move this folder, run `./service.sh install` again. The log is
+`~/Library/Logs/nowplaying.log`.
+
 ## Keys on the board
 
 | Key | Action |
@@ -40,6 +55,7 @@ There is no volume control.
   `atkinson`, is crisp. If the cover looks too dotted or flickers on the screen, try `threshold`
   (no dots at all); `fs` (Floyd-Steinberg) is the smoothest but the dottiest.
 - `--port /dev/cu.usbmodemXXXX` choose the serial port (normally found automatically).
+- `--wait` keep running: wait for the board and reconnect (what the login service uses).
 - `--demo` send a test card instead of reading Apple Music, to try the screen.
 
 ## How it works
