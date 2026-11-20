@@ -4,4 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 tools/nowplaying/.venv/
-.cache/__pycache__/
+.cache/
+__pycache__/
