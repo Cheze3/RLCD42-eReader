@@ -321,8 +321,40 @@ def open_board(args) -> "Board":
     return Board(args.port)
 
 
+def measure_latency(board, count: int = 30, timeout: float = 2.0) -> List[float]:
+    """Round-trip time in ms of `count` PINGs (the board answers each with PONG); a lost one is None."""
+    results = []
+    for _ in range(count):
+        started = time.perf_counter()
+        board.send("CMD:NP PING\n")
+        reply = None
+        while time.perf_counter() - started < timeout:
+            if "PONG" in board.events():
+                reply = (time.perf_counter() - started) * 1000
+                break
+        results.append(reply)
+        time.sleep(0.25)
+    return results
+
+
+def print_latency(results: List[Optional[float]]) -> None:
+    got = sorted(r for r in results if r is not None)
+    if not got:
+        print("No answer from the board. Is 'Now Playing' open?")
+        return
+    print(f"{len(got)}/{len(results)} answered. Round trip: "
+          f"min {got[0]:.0f} ms, median {got[len(got) // 2]:.0f} ms, "
+          f"95th {got[min(len(got) - 1, int(len(got) * 0.95))]:.0f} ms, max {got[-1]:.0f} ms")
+
+
 def run(args) -> None:
     board = open_board(args)
+    if args.latency:
+        try:
+            print_latency(measure_latency(board))
+        finally:
+            board.ser.close()
+        sys.exit(0)
     args.connected = True
     try:
         _talk(args, board)
@@ -410,6 +442,8 @@ def main() -> None:
                                        "Now Playing screen first)")
     parser.add_argument("--wifi", action="store_true",
                         help="use Wi-Fi when the board is listening for it (crosspoint-np.local), otherwise USB")
+    parser.add_argument("--latency", action="store_true",
+                        help="measure how fast the board answers (30 pings), then exit; open Now Playing first")
     parser.add_argument("--dither", choices=["fs", "atkinson", "threshold"], default="atkinson",
                         help="how cover art is turned into black and white (default: atkinson)")
     parser.add_argument("--demo", action="store_true", help="send a test card instead of reading the media player")

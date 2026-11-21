@@ -5,6 +5,7 @@
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <esp_wifi.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -89,7 +90,8 @@ void NowPlayingActivity::onWifiSelected(bool joined) {
     requestUpdate();
     return;
   }
-  WiFi.setSleep(false);  // modem sleep delays incoming lines by up to a second or more
+  // Light modem sleep: the radio sleeps between beacons, which saves power. Lines may arrive a little later.
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   server = makeUniqueNoThrow<WiFiServer>(nowplaying::kTcpPort);
   if (!server) {
     LOG_ERR("NOWPLAY", "out of memory: Wi-Fi server");

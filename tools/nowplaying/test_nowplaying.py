@@ -294,5 +294,28 @@ class ChoosingTheLink(unittest.TestCase):
         self.assertEqual(self.calls, [(None, proto.HOST_NAME), (None, None)])
 
 
+class Latency(unittest.TestCase):
+    def test_every_ping_is_timed_and_a_lost_one_is_none(self):
+        class Echo(np.Board):
+            def __init__(self):
+                self._pending, self.pings = [], 0
+
+            def send(self, text):
+                self.pings += 1
+
+            def events(self):
+                return ["PONG"] if self.pings != 2 else []  # the second ping gets no answer
+
+        original = np.time.sleep
+        np.time.sleep = lambda _s: None
+        try:
+            results = np.measure_latency(Echo(), count=3, timeout=0.05)
+        finally:
+            np.time.sleep = original
+        self.assertIsNotNone(results[0])
+        self.assertIsNone(results[1])
+        self.assertIsNotNone(results[2])
+
+
 if __name__ == "__main__":
     unittest.main()
